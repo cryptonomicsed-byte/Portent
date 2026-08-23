@@ -1,0 +1,132 @@
+{
+  "name": "Portent",
+  "symbol": "PORT",
+  "tagline": "The Nostr-native prediction economy — stake on the future, earn for being right.",
+  "version": "1.0.0",
+  "total_supply": 1000000000,
+  "decimals": 9,
+  "launch": {
+    "platform": "pump.fun",
+    "initial_mc_target_sol": 50000,
+    "liquidity": "bonding curve completion -> Raydium LP lock",
+    "metadata_tokenomics_url": "https://raw.githubusercontent.com/cryptonomicsed-byte/Portent/main/tokenomics.json",
+    "steps": [
+      "deploy SPL mint (supply + decimals)",
+      "initialize bonding curve",
+      "set MC target 50000 SOL",
+      "curve completion -> Raydium liquidity lock",
+      "register metadata with tokenomics URL",
+      "buyback + burn executors live",
+      "staking active",
+      "governance enabled",
+      "first oracle panel + bounties",
+      "workspaces opt in"
+    ]
+  },
+  "distribution": {
+    "predictor_oracle_rewards": { "amount": 400000000, "pct": 40, "vesting": "24mo linear", "purpose": "predictor winnings top-up, oracle resolution fees, cross-checker fees" },
+    "initial_liquidity": { "amount": 100000000, "pct": 10, "lock": "12mo", "purpose": "pair liquidity + curve seed" },
+    "team": { "amount": 100000000, "pct": 10, "vesting": "3mo cliff + 18mo", "purpose": "core builders" },
+    "community_fund": { "amount": 150000000, "pct": 15, "vesting": "36mo", "control": "governance", "purpose": "market bounties, event-class grants, relay ops grants" },
+    "buyback_reserve": { "amount": 100000000, "pct": 10, "purpose": "funds daily Jupiter limit-order buybacks" },
+    "burn_pool": { "amount": 150000000, "pct": 15, "purpose": "pre-funded milestone + governance burn supply" }
+  },
+  "buyback": {
+    "funding_source": "2% settlement fee on winning payouts",
+    "reserve_share_pct": 50,
+    "frequency": "daily",
+    "method": "Jupiter limit orders",
+    "min_sol_per_tx": 0.1,
+    "max_sol_per_tx": 5.0,
+    "slippage_bps": 100,
+    "auto_trigger_reserve_sol": 100,
+    "destiny": "purchased tokens are BURNED"
+  },
+  "burns": {
+    "streams": [
+      { "id": "settlement_fee", "trigger": "every settlement", "amount": "2% of the 2% settlement fee burned at source" },
+      { "id": "expired_unresolved", "trigger": "prediction expires with no resolution", "amount": "full stake forfeited -> burn (default stake 1000)" },
+      { "id": "loser_stake", "trigger": "settlement, losing side", "amount": "full losing stake -> pool; pool surplus over winner profits -> burn" },
+      { "id": "milestone", "trigger": "resolved-event count ladder", "amount": "50K->0.1% / 100K->0.5% / 500K->2% / 1M->5% of burn-pool reserve" },
+      { "id": "governance", "trigger": "community vote", "amount": "5% quorum, max 2% of reserve per proposal" }
+    ],
+    "settlement_fee_burn_bps": 200,
+    "expired_stake_burn": "full stake",
+    "default_stake": 1000,
+    "milestones": [
+      { "resolved_events": 50000,  "burn_pct_of_reserve": 0.1 },
+      { "resolved_events": 100000, "burn_pct_of_reserve": 0.5 },
+      { "resolved_events": 500000, "burn_pct_of_reserve": 2.0 },
+      { "resolved_events": 1000000, "burn_pct_of_reserve": 5.0 }
+    ],
+    "governance": { "quorum_pct": 5, "max_pct_of_reserve_per_proposal": 2 }
+  },
+  "staking": {
+    "tiers": [
+      { "lock_days": 30,  "apr_pct": 8  },
+      { "lock_days": 90,  "apr_pct": 12 },
+      { "lock_days": 365, "apr_pct": 20 }
+    ],
+    "auto_compound": true,
+    "revenue_share": "50% of settlement-fee remainder (after source burn) distributed to stakers at snapshot",
+    "airdrop_min_hold": 1000,
+    "airdrop_frequency": "quarterly",
+    "airdrop_recipients": "top predictors by accuracy holding >=1000 PORT"
+  },
+  "agent_incentives": {
+    "work_types": {
+      "oracle_resolution": { "base_reward": 500, "unit": "PORT", "note": "per verified resolution" },
+      "cross_check": { "base_reward": 150, "unit": "PORT", "note": "per matching cross-check attestation" },
+      "prediction_win": { "base_reward": "stake * (odds_bp-10000) / 10000", "unit": "PORT", "note": "profit paid from losing pool, surplus burned" }
+    },
+    "spend": {
+      "prediction_stake": { "min": 100, "max": 5000, "default": 1000, "note": "tier-gated: verified+ can stake >=500, trusted+ >=2000" },
+      "compute_payment": { "note": "resolution compute paid in PORT from community fund" }
+    },
+    "multipliers": {
+      "quality_range": [0.5, 3.0],
+      "tier": { "unverified": 1.0, "verified": 1.5, "trusted": 2.0, "elite": 2.5, "legendary": 3.0 }
+    },
+    "guards": { "cooldown_seconds": 60, "daily_earning_cap": 50000 }
+  },
+  "governance": {
+    "voting": "1 token = 1 vote",
+    "delegation": true,
+    "quorum_pct": 3,
+    "voting_window_hours": 72,
+    "execution_delay_hours": 24,
+    "min_proposal_stake": 100000,
+    "proposal_types": ["event_class_whitelist", "oracle_panel_change", "fee_params", "milestone_burn"]
+  },
+  "event_kinds": {
+    "cross_reference": 30007,
+    "attestation": 30009,
+    "reputation_snapshot": 30010,
+    "stake_claim": 30011,
+    "governance": 30012,
+    "prediction_post": 30015,
+    "resolution": 30016,
+    "dispute": 30017,
+    "note": "30000-39999 range, no collision with Buzz 40000+; d-tags product-scoped portent:<market>:<pubkey>"
+  },
+  "onchain_accounts": ["PREDICTION", "RESOLUTION", "REPUTATION", "DISTRIBUTION", "BURN", "STAKE", "CONFIG", "ORACLE"],
+  "reputation": {
+    "composite_range": [0, 1000],
+    "tiers": {
+      "legendary": { "min_composite": 800, "min_resolved": 50 },
+      "elite":     { "min_composite": 500, "min_resolved": 30 },
+      "trusted":   { "min_composite": 300, "min_resolved": 15 },
+      "verified":  { "min_composite": 100, "min_resolved": 5 }
+    },
+    "portable": "keyed by Nostr pubkey, carries linked_communities tags, survives across Buzz workspaces"
+  },
+  "odds_menu_bp": [11000, 12000, 15000, 20000, 30000, 40000],
+  "odds_convention": "basis points where 10000 = even money (1.0x); profit on win = stake * (odds_bp-10000)/10000",
+  "settlement": {
+    "fee_bps": 200,
+    "fee_split": { "burn_at_source_bps": 200, "buyback_reserve_pct": 50, "staker_pool_pct": 50 },
+    "winner": "stake returned + profit (stake * (odds_bp-10000)/10000) paid from losing pool; pool surplus burned",
+    "loser": "stake forfeited to pool; surplus burned",
+    "expired": "all stakes in market burned"
+  }
+}
