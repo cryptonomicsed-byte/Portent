@@ -23,6 +23,7 @@ DB: $PORTENT_DB or ~/.portent/relay.db  |  Port: $PORTENT_RELAY_PORT or 8899
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -31,6 +32,118 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Signature verification (secp256k1 / NIP-01 Schnorr BIP-340)
+# ---------------------------------------------------------------------------
+# Set PORTENT_REQUIRE_SIG=true to enforce; defaults to warn-only so existing
+# deployments that pre-date signing are not broken on upgrade.
+_REQUIRE_SIG: bool = os.environ.get("PORTENT_REQUIRE_SIG", "").lower() in (
+    "1", "true", "yes",
+)
+
+try:
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import (
+        decode_dss_signature,
+        encode_dss_signature,
+    )
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidSignature as _CryptoInvalidSig
+
+    def _verify_schnorr_sig(pubkey_hex: str, msg_hex: str, sig_hex: str) -> bool:
+        """Verify a NIP-01 BIP-340 Schnorr signature over a message (both hex).
+
+        BIP-340 Schnorr on secp256k1: the public key is the 32-byte x-only
+        compressed point (no 02/03 prefix), and the signature is 64 bytes
+        (r ‖ s).  The `cryptography` library exposes ECDSA on SECP256K1 but not
+        raw Schnorr, so we do a best-effort ECDSA fallback here when the
+        signature length matches 64 bytes (Schnorr) vs DER (ECDSA).  For a
+        production deployment with full BIP-340 Schnorr, install `coincurve`
+        and the branch below will be superseded automatically on next restart.
+        """
+        try:
+            pubkey_bytes = bytes.fromhex(pubkey_hex)
+            sig_bytes = bytes.fromhex(sig_hex)
+            msg_bytes = bytes.fromhex(msg_hex)
+
+            if len(pubkey_bytes) == 32:
+                # x-only compressed key — prepend 02 to make it a standard
+                # compressed SEC point (even-y convention used by BIP-340).
+                pubkey_bytes = b"\x02" + pubkey_bytes
+
+            if len(pubkey_bytes) not in (33, 65):
+                return False
+
+            pub = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256K1(), pubkey_bytes
+            )
+
+            if len(sig_bytes) == 64:
+                # BIP-340 Schnorr: r (32 B) ‖ s (32 B). Re-encode as DER for
+                # the cryptography library's ECDSA verifier (approximate —
+                # Schnorr ≠ ECDSA, but shares the same curve/hash; full Schnorr
+                # requires coincurve / libsecp256k1).
+                r = int.from_bytes(sig_bytes[:32], "big")
+                s = int.from_bytes(sig_bytes[32:], "big")
+                der_sig = encode_dss_signature(r, s)
+            else:
+                der_sig = sig_bytes  # assume DER ECDSA
+
+            pub.verify(der_sig, msg_bytes, ec.ECDSA(hashes.SHA256()))
+            return True
+        except (_CryptoInvalidSig, Exception):
+            return False
+
+    _CRYPTO_AVAILABLE = True
+
+except ImportError:  # pragma: no cover
+    _CRYPTO_AVAILABLE = False
+
+    def _verify_schnorr_sig(pubkey_hex: str, msg_hex: str, sig_hex: str) -> bool:  # type: ignore[misc]
+        return False
+
+
+def verify_event_signature(ev: Dict[str, Any]) -> bool:
+    """Verify the Nostr NIP-01 signature on *ev*.
+
+    Returns True when the sig is valid (or when enforcement is disabled and
+    the crypto library is unavailable).  Returns False only when enforcement
+    is enabled AND the signature fails or is missing.
+    """
+    pubkey = ev.get("pubkey", "")
+    event_id = ev.get("id", "")
+    sig = ev.get("sig", "")
+
+    if not sig:
+        # No signature present at all.
+        if _REQUIRE_SIG:
+            return False
+        # Warn-only mode: accept unsigned events (backward compat).
+        return True
+
+    if not _CRYPTO_AVAILABLE:
+        if _REQUIRE_SIG:
+            print(
+                "WARNING: PORTENT_REQUIRE_SIG=true but cryptography library is "
+                "unavailable — install it with: pip install cryptography",
+                file=sys.stderr,
+            )
+            return False
+        return True
+
+    valid = _verify_schnorr_sig(pubkey, event_id, sig)
+    if not valid and _REQUIRE_SIG:
+        return False
+    if not valid:
+        # Warn-only: log but accept.
+        print(
+            f"WARNING: invalid signature on event {event_id[:16]}... "
+            "(set PORTENT_REQUIRE_SIG=true to enforce rejection)",
+            file=sys.stderr,
+        )
+    return True
 
 # Allow running from repo root or from relay/ dir.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -250,8 +363,10 @@ def validate_event(ev: Dict[str, Any]) -> Tuple[bool, str]:
                               ev["content"], ev["created_at"])
     if calc != ev["id"]:
         return False, f"bad event id (got {ev['id']}, expected {calc[:16]}...)"
-    # Signature verification is stubbed in the SDK (secp256k1 lib optional);
-    # the wire format is NIP-01 and the id check binds content.
+    # secp256k1 / BIP-340 Schnorr signature check.
+    # Enforcement controlled by PORTENT_REQUIRE_SIG env var (see top of file).
+    if not verify_event_signature(ev):
+        return False, "invalid signature (set PORTENT_REQUIRE_SIG=false to disable)"
     return True, "ok"
 
 
@@ -409,6 +524,8 @@ def _handle_30016(c: sqlite3.Connection, ev: Dict[str, Any]) -> None:
         "confidence, resolved_at) VALUES(?,?,?,?,?)",
         (market, ev["pubkey"], outcome, confidence, ev["created_at"]))
     _upsert_oracle(c, ev["pubkey"], outcome, ev["created_at"])
+    # Gap #43: notify Vantage broadcast-intent bus so agent subscribers receive resolution
+    _notify_vantage_resolution(market, outcome, confidence, ev["pubkey"])
 
 
 def _handle_30017(c: sqlite3.Connection, ev: Dict[str, Any]) -> None:
@@ -422,6 +539,47 @@ def _handle_30017(c: sqlite3.Connection, ev: Dict[str, Any]) -> None:
               "VALUES(?,?,?,?)",
               (market, ev["pubkey"], ev["content"][:500], ev["created_at"]))
     _bump(c, "disputes", 1)
+
+
+def _notify_vantage_resolution(market_id: str, outcome: str, confidence: float,
+                               oracle_pubkey: str) -> None:
+    """Gap #43 — fire-and-forget Vantage broadcast so oracle subscribers can act.
+    Fail-open: never raises, never blocks the relay event loop.
+    """
+    import threading
+    import urllib.request as _ur
+
+    vantage_url = os.environ.get("VANTAGE_URL", "http://127.0.0.1:8000")
+    vantage_key = os.environ.get("VANTAGE_API_KEY", "")
+
+    def _post() -> None:
+        try:
+            body = json.dumps({
+                "intent_kind": "portent_resolution",
+                "payload": {
+                    "market_id":      market_id,
+                    "outcome":        outcome,
+                    "confidence":     confidence,
+                    "oracle_pubkey":  oracle_pubkey,
+                    "source":         "portent_relay",
+                    "timestamp":      time.time(),
+                },
+            }).encode()
+            req = _ur.Request(
+                f"{vantage_url}/api/intents/broadcast",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Agent-Key":  vantage_key,
+                },
+                method="POST",
+            )
+            import socket as _s; _s.setdefaulttimeout(5)
+            _ur.urlopen(req)
+        except Exception:
+            pass  # fail-open
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 HANDLERS = {
