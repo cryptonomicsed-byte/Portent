@@ -249,6 +249,17 @@ CREATE TABLE IF NOT EXISTS resolutions(
     cross_checks INTEGER NOT NULL DEFAULT 0
 );
 
+-- P1-14: resolutions from keys outside PORTENT_ORACLE_PUBKEYS. Stored, never
+-- settled; listed by GET /resolutions?status=unverified.
+CREATE TABLE IF NOT EXISTS unverified_resolutions(
+    event_id TEXT PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    oracle TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS disputes(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     market_id TEXT NOT NULL,
@@ -508,9 +519,23 @@ def _handle_30015(c: sqlite3.Connection, ev: Dict[str, Any]) -> None:
     _bump(c, "open_predictions", 1)
 
 
+def _oracle_allowlist() -> Optional[set]:
+    """P1-14 (interim; P3-04 replaces it with Crucible's oracle_authorities).
+    PORTENT_ORACLE_PUBKEYS = comma-separated hex pubkeys allowed to settle.
+    Unset or empty -> None, which keeps today's behaviour (any key settles)."""
+    raw = os.environ.get("PORTENT_ORACLE_PUBKEYS", "")
+    keys = {k.strip().lower() for k in raw.split(",") if k.strip()}
+    return keys or None
+
+
 def _handle_30016(c: sqlite3.Connection, ev: Dict[str, Any]) -> None:
     """Resolution: settles the market. outcome from tag 'outcome' (yes|no),
-    confidence from content JSON."""
+    confidence from content JSON.
+
+    With PORTENT_ORACLE_PUBKEYS set, a resolution signed by any other key is
+    kept (the event is already stored, and it is recorded as unverified) but
+    settles nothing and makes nobody an oracle. Before this, any key could
+    settle any market and was auto-added to the oracle table."""
     market = _tag(ev, "m")
     if not market:
         return
@@ -522,6 +547,13 @@ def _handle_30016(c: sqlite3.Connection, ev: Dict[str, Any]) -> None:
     except json.JSONDecodeError:
         data = {}
     confidence = float(data.get("confidence", 0.8))
+    allow = _oracle_allowlist()
+    if allow is not None and str(ev["pubkey"]).lower() not in allow:
+        c.execute(
+            "INSERT OR IGNORE INTO unverified_resolutions(event_id, market_id, "
+            "oracle, outcome, confidence, created_at) VALUES(?,?,?,?,?,?)",
+            (ev["id"], market, ev["pubkey"], outcome, confidence, ev["created_at"]))
+        return
     if _crucible_gate.enabled():  # P3-04; off = path not entered
         may_settle, why = _crucible_gate.check_resolution(ev)
         if not may_settle:
@@ -842,10 +874,17 @@ class PortentRelayHandler(BaseHTTPRequestHandler):
                                 (pk,)).fetchone()
                 self._send(200, {"reputation": dict(row) if row else None})
             elif path == "/resolutions":
-                rows = c.execute(
-                    "SELECT * FROM resolutions ORDER BY resolved_at DESC "
-                    "LIMIT 100").fetchall()
-                self._send(200, {"resolutions": [dict(r) for r in rows]})
+                if qs.get("status", [""])[0] == "unverified":
+                    rows = c.execute(
+                        "SELECT * FROM unverified_resolutions ORDER BY "
+                        "created_at DESC LIMIT 100").fetchall()
+                    self._send(200, {"resolutions": [dict(r) for r in rows],
+                                     "status": "unverified"})
+                else:
+                    rows = c.execute(
+                        "SELECT * FROM resolutions ORDER BY resolved_at DESC "
+                        "LIMIT 100").fetchall()
+                    self._send(200, {"resolutions": [dict(r) for r in rows]})
             elif path == "/governance":
                 rows = c.execute("SELECT * FROM governance ORDER BY "
                                  "created_at DESC LIMIT 50").fetchall()
