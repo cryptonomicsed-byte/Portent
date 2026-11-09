@@ -181,6 +181,14 @@ except ImportError:  # pragma: no cover - standalone fallback
         return 0
 
 
+# P3-04: Crucible-only settlement gate (flag PORTENT_CRUCIBLE_ONLY, default off).
+try:
+    from relay import crucible_gate as _crucible_gate
+except ImportError:  # pragma: no cover - run from relay/
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import crucible_gate as _crucible_gate  # type: ignore[no-redef]
+
+
 DB_PATH = os.environ.get("PORTENT_DB",
                          os.path.expanduser("~/.portent/relay.db"))
 RELAY_PORT = int(os.environ.get("PORTENT_RELAY_PORT", "8899"))
@@ -546,6 +554,11 @@ def _handle_30016(c: sqlite3.Connection, ev: Dict[str, Any]) -> None:
             "oracle, outcome, confidence, created_at) VALUES(?,?,?,?,?,?)",
             (ev["id"], market, ev["pubkey"], outcome, confidence, ev["created_at"]))
         return
+    if _crucible_gate.enabled():  # P3-04; off = path not entered
+        may_settle, why = _crucible_gate.check_resolution(ev)
+        if not may_settle:
+            _crucible_gate.record_refusal(c, ev, market, outcome, confidence, why)
+            return
     row = c.execute("SELECT * FROM predictions WHERE market_id=?",
                     (market,)).fetchone()
     if row is None or row["status"] != "open":

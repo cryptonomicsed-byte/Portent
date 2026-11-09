@@ -130,3 +130,19 @@ python3 contracts/portent_program.py
 - Signature + websocket transport are documented stubs in the SDK (drop in
   coincurve for real sigs; nothing else changes).
 - All modules stdlib-only and standalone-runnable; compile-checked.
+
+## Crucible-only settlement (P3-04, opt-in)
+
+| Env | Default | Meaning |
+|---|---|---|
+| `PORTENT_CRUCIBLE_ONLY` | off | On: a 30016 resolution settles only if signed by a Crucible oracle key |
+| `PORTENT_CRUCIBLE_KEYS` | empty | Comma-separated 64-hex x-only pubkeys |
+| `PORTENT_CRUCIBLE_POLICY` | unset | Path to a Crucible policy JSON; its `oracle_authorities` are added |
+
+With the flag on, the relay checks the key against the list, recomputes the event id, and verifies
+the BIP-340 signature itself (`relay/bip340.py`), whatever `PORTENT_REQUIRE_SIG` says. An empty
+list means nobody settles. A refused resolution is still stored as an event and recorded in
+`crucible_refused_resolutions` with a reason (`unlisted_key`, `bad_signature`, `bad_event_id`,
+`no_crucible_keys_configured`). It settles nothing and adds no oracle row. Flag off: behaviour is unchanged.
+
+Tests: `python -m pytest -q` (needs `pytest`).
